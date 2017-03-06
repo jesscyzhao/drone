@@ -2,25 +2,40 @@
 # -*- coding: utf-8 -*-
 import json
 import re
+import os
 import sys
+import fnmatch
 import datetime
 import pandas as pd
 from collections import Counter
 from xpinyin import Pinyin
 
+BASE_DIRECTORY = os.path.abspath(os.getcwd())
 
 
-sys.getdefaultencoding
+def scrape_directory_for_raw_data_path(dir_path, file_type='*.record'):
+    """
+    Scrape the given directory and collect the absolute path of files that match the file_type into a list.
+    :param dir_path: path string, root directory of the project/data
+    :param file_type: string, common expression format of the file type
+    :return: list
+    """
+
+    raw_data_path_list = []
+    for subdir, dirs, files in os.walk(dir_path):
+        for this_file in files:
+            if fnmatch.fnmatch(this_file, file_type):
+                raw_data_path_list.append(os.path.join(subdir, this_file))
+
+    return raw_data_path_list
 
 
-BASE_DIRECTORY = '/'.join(['C:', 'Users', 'Chunyi Zhao', 'Projects', 'drone'])
-print BASE_DIRECTORY
-BS_FILE = '/'.join([BASE_DIRECTORY, 'raw_data', 'bsdata.json'])
-print BS_FILE
-SS_FILE = '/'.join([BASE_DIRECTORY, 'raw_data', 'ssdata.json'])
-
-
-def load_right_lines(file_path):
+def load_right_lines(file_path, silence=True):
+    """
+    Try load each line in a given file, print out error if any
+    :param file_path: string
+    :return: list of line item in a file
+    """
 
     try:
         records = [json.loads(line) for line in open(file_path)]
@@ -29,13 +44,54 @@ def load_right_lines(file_path):
         bad_line = []
         line_count = 0
         records = []
-        for line in open(SS_FILE):
+        for line in open(file_path):
             line_count += 1
             try:
                 records.append(json.loads(line))
             except Exception as err:
-                bad_line.append(line_count)
+                bad_line.append((line_count, err))
+        print 'Loading %s lines with %s lines compromised' % (line_count, len(bad_line))
+        if len(bad_line) > 0:
+            for log in bad_line:
+                print 'Error at line %s : %s; Excluded from raw data' % log
     return records
+
+
+def extract_gps_and_signal_data(records, name_ext, split_second=False, test=False):
+    """
+    Extract gps and signal data: east, north (location metric split), 时间，速度，位置，高度，信号强度，信噪比. Return a
+    pandas dataframe
+    :param records: list of line item
+    :param name_ext: int, 0 if bs 1 if ss
+    :param split_second: bool, todo, whether to include millisecond data
+    :param test: bool, true if under testing, only load in the first 100 records in the file
+    :return: pd.DataFrame
+    """
+    name_ext = '_' + str(name_ext)
+    df_list = []
+    counter = 0
+    p = Pinyin()
+    row_range = 100 if test else len(records)
+    for i in range(row_range):
+        if i % 5000 == 0:
+            print '跑完{}行'.format(i)
+        if counter % 500 == 0 and counter > 0:
+            print '抓取{}行'.format(counter)
+        this_record = records[i]
+        if not ('stream.gps_status' in this_record and 'osd.measurement' in this_record and
+                 p.get_pinyin(this_record['osd.measurement']) != u'mei-you-ke-yong-ce-liang-xin-xi'):
+            continue
+        gps_info = general_split_string(this_record['stream.gps_status'], ' ', ':')
+        signal, snr = measurement_split_string(this_record['osd.measurement'])
+        df_list.append(tuple(gps_info.values()) + (signal, snr))
+        counter += 1
+
+    df = pd.DataFrame(df_list, columns=['east' + name_ext, 'north' + name_ext,
+                                        'shi-jian' + name_ext, 'su-du' + name_ext,
+                                        'wei-zhi' + name_ext, 'gao-du' + name_ext,
+                                        'xin-hao-qiang-du' + name_ext,
+                                        'xin-zao-bi' + name_ext])
+    return df
 
 
 def general_split_string(chinese_string, element_sep, equal_sign):
@@ -91,6 +147,11 @@ def general_split_string(chinese_string, element_sep, equal_sign):
 
 
 def measurement_split_string(measurement_string):
+    """
+    Split signal metric.
+    :param measurement_string: string that contains measurement metrics
+    :return: float, float
+    """
 
     p = Pinyin()
     signal_string, snr_string = [p.get_pinyin(x) for x in measurement_string.split('$')]
@@ -107,52 +168,29 @@ def measurement_split_string(measurement_string):
     return float(signal), float(snr)
 
 
-def extract_gps_measurement_data(records, name_ext, split_second=False):
-    name_ext = '_' + name_ext
-    df_list = []
-    counter = 0
-    p = Pinyin()
-    for i in range(len(records)):
-        if i % 5000 == 0:
-            print '跑完{}行'.format(i)
-        if counter % 5000 == 0 and counter > 0:
-            print '抓取{}行'.format(counter)
-        this_record = records[i]
-        if not ('stream.gps_status' in this_record and 'osd.measurement' in this_record and
-                 p.get_pinyin(this_record['osd.measurement']) != u'mei-you-ke-yong-ce-liang-xin-xi'):
-            continue
-        gps_info = general_split_string(this_record['stream.gps_status'], ' ', ':')
-        signal, snr = measurement_split_string(this_record['osd.measurement'])
-        df_list.append(tuple(gps_info.values()) + (signal, snr))
-        counter += 1
+def extract_raw_data_into_csv(data_directory, test=False):
+    """
+    Process raw data into csv.
+    TODO: make it generalizable for all kinds of data output (currenly gps and signal data)
+    :param data_directory: root directory of data / project
+    :param test: bool, if true then only grab first 100 lines in each file and convert
+    :return: none
+    """
+    raw_data_path = scrape_directory_for_raw_data_path(data_directory)
+    print raw_data_path
+    for file in raw_data_path:
+        record = load_right_lines(file)
+        file_name = os.path.basename(file)
+        print '\n Processing %s \n' % file_name
+        sub_dir = os.path.dirname(file)
+        name_ext = 0 if re.search('bs', file_name) else 1
+        df = extract_gps_and_signal_data(record, name_ext, test=test)
+        print df.head()
+        file_ext = '_test.csv' if test else '.csv'
+        df.to_csv(os.path.join(sub_dir, file_name.split('.')[0] + file_ext), index=False)
+        print os.path.join(sub_dir, file_name.split('.')[0] + file_ext)
 
-    df = pd.DataFrame(df_list, columns=['east' + name_ext, 'north' + name_ext,
-                                        'shi-jian' + name_ext, 'su-du' + name_ext,
-                                        'wei-zhi' + name_ext, 'gao-du' + name_ext,
-                                        'xin-hao-qiang-du' + name_ext,
-                                        'xin-zao-bi' + name_ext])
-    return df
 
 if __name__ == "__main__":
-
-    ss_records = load_right_lines(SS_FILE)
-    # bs_records = load_right_lines(BS_FILE)
-    # print extract_gps_measurement_data(ss_records[18000:19000], '0')
-
-    # bs_df = extract_gps_measurement_data(bs_records, '2')
-    ss_df = extract_gps_measurement_data(ss_records, '0')
-    # print bs_df.head()
-    # print ss_df.head()
-    # bs_df.to_csv('/'.join([BASE_DIRECTORY, 'raw_data', 'bs_gps_signal.csv']))
-    ss_df.to_csv('/'.join([BASE_DIRECTORY, 'raw_data', 'ss_gps_signal.csv']), index=False)
-
-    # gps_measure_df = bs_df[['shi-jian_2', 'signal_2', 'snr_2']].merge(ss_df[['shi-jian_0', 'signal_0', 'snr_0']],
-    #                                                                   how='left',
-    #                                                                   left_on='shi-jian_2', right_on='shi-jian_0',
-    #                                                                   sort=True)
-    # print gps_measure_df.head()
-    # gps_measure_df.to_csv('/'.join([BASE_DIRECTORY, 'raw_data', 'combined_gps_signal.csv']))
-    # TODO: data structure
-    # TODO: combine GPS data and xhqd and xzb
-    # TODO: comine data sources --> merge two dataframes
+    extract_raw_data_into_csv(os.path.join(BASE_DIRECTORY, 'raw_data'), test=True)
     print '你妈喊你回家吃饭！'
